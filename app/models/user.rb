@@ -2,6 +2,8 @@
 require "encryption"
 
 class User < ApplicationRecord
+  attr_accessor :password
+
   validates :password, :presence => true,
                         :confirmation => true,
                         :if => :password,
@@ -39,7 +41,7 @@ class User < ApplicationRecord
 
     def self.authenticate(email, password)
       user = find_by_email(email) || User.new(:password => "")
-      if Rack::Utils.secure_compare(user.password, Digest::MD5.hexdigest(password))
+      if Rack::Utils.secure_compare(user.password_hash.to_s, Digest::MD5.hexdigest(password))
         return user
       else
         raise "Incorrect username or password"
@@ -47,8 +49,8 @@ class User < ApplicationRecord
     end
 
     def hash_password
-      if will_save_change_to_password?
-        self.password = Digest::MD5.hexdigest(self.password)
+      if password.present?
+        self.password_hash = Digest::MD5.hexdigest(password)
       end
     end
 
