@@ -23,22 +23,9 @@ class SessionsController < ApplicationController
     end
   end
 
-  if user
-    if params[:remember_me]
-      cookies.permanent[:auth_token] = user.auth_token
-    else
-      session[:user_id] = user.id
-    end
-    redirect_to path
-  else
-    flash[:error] = e.message
-    render "sessions/new"
+  def destroy
+    cookies.delete(:auth_token)
+    reset_session
+    redirect_to root_path
   end
-end
-
-def destroy
-  cookies.delete(:auth_token)
-  reset_session
-  redirect_to root_path
-end
 end
