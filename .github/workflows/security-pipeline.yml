@@ -21,35 +21,30 @@ permissions:
   security-events: write
 
 jobs:
+  # ruby:2.5.0 (Debian stretch, glibc 2.24) can't run the Node 24 runtime GitHub
+  # Actions now forces for JS-based actions, so these jobs can't use the
+  # `container:` job feature (actions/checkout would crash inside it). Instead
+  # we check out on the host and do all Ruby work via `docker run` against the
+  # same image the app actually runs on.
   test:
     name: Test suite
     runs-on: ubuntu-latest
-    container:
-      image: ruby:2.5.0
     steps:
       - uses: actions/checkout@v4
-      - name: Configure archived Debian stretch mirrors
+      - name: Run test suite in ruby:2.5.0
         run: |
-          printf '%s\n' \
-            'deb [trusted=yes] http://archive.debian.org/debian stretch main' \
-            'deb [trusted=yes] http://archive.debian.org/debian-security stretch/updates main' \
-            > /etc/apt/sources.list
-          apt-get -o Acquire::Check-Valid-Until=false update -qq
-          apt-get install -y build-essential libpq-dev nodejs sqlite3 libsqlite3-dev
-      - name: Cache gems
-        uses: actions/cache@v4
-        with:
-          path: vendor/bundle
-          key: gems-${{ runner.os }}-${{ hashFiles('Gemfile.lock') }}
-      - name: Bundle install
-        run: |
-          bundle config set path 'vendor/bundle'
-          bundle install --jobs 4 --retry 3
-      - name: Prepare test database
-        run: |
-          bundle exec rails db:schema:load RAILS_ENV=test || bundle exec rake db:test:prepare
-      - name: Run test suite (RSpec)
-        run: bundle exec rspec --format progress --format RspecJunitFormatter --out tmp/rspec-results.xml
+          docker run --rm -v "$PWD":/myapp -w /myapp ruby:2.5.0 bash -c '
+            set -e
+            printf "%s\n" \
+              "deb [trusted=yes] http://archive.debian.org/debian stretch main" \
+              "deb [trusted=yes] http://archive.debian.org/debian-security stretch/updates main" \
+              > /etc/apt/sources.list
+            apt-get -o Acquire::Check-Valid-Until=false update -qq
+            apt-get install -y build-essential libpq-dev nodejs sqlite3 libsqlite3-dev >/dev/null
+            bundle install --jobs 4 --retry 3
+            bundle exec rails db:schema:load RAILS_ENV=test || bundle exec rake db:test:prepare
+            bundle exec rspec --format progress --format RspecJunitFormatter --out tmp/rspec-results.xml
+          '
       - name: Upload test results
         if: always()
         uses: actions/upload-artifact@v4
@@ -61,17 +56,16 @@ jobs:
   brakeman:
     name: SAST (Brakeman)
     runs-on: ubuntu-latest
-    container:
-      image: ruby:2.5.0
     steps:
       - uses: actions/checkout@v4
-      - name: Install Brakeman
-        run: gem install brakeman -v '~> 5.4'
-      - name: Run Brakeman
+      - name: Run Brakeman in ruby:2.5.0
         run: |
           mkdir -p reports
-          brakeman -o reports/brakeman.json -o reports/brakeman.html \
-            --no-exit-on-warn --no-exit-on-error
+          docker run --rm -v "$PWD":/myapp -w /myapp ruby:2.5.0 bash -c '
+            set -e
+            gem install brakeman -v "~> 5.4" --no-document -q
+            brakeman -o reports/brakeman.json -o reports/brakeman.html --no-exit-on-warn --no-exit-on-error
+          '
       - name: Upload Brakeman report
         uses: actions/upload-artifact@v4
         with:
@@ -92,12 +86,15 @@ jobs:
       - name: Wait for app to become healthy
         run: |
           for i in $(seq 1 30); do
-            if curl -sf http://localhost:3000/ -o /dev/null; then
+            code=$(curl -s -o /tmp/root_response.html -w '%{http_code}' http://localhost:3000/ || echo "000")
+            if [ "$code" = "200" ]; then
               echo "App is up"; exit 0
             fi
-            echo "Waiting for app... ($i)"; sleep 5
+            echo "Waiting for app... ($i, last status $code)"; sleep 5
           done
-          echo "App did not become healthy in time"
+          echo "App did not become healthy in time. Last response body:"
+          cat /tmp/root_response.html || true
+          echo "Container logs:"
           docker logs railsgoat_web || true
           exit 1
       - name: ZAP baseline scan
@@ -157,6 +154,14 @@ jobs:
           name: security-report-markdown
           path: docs/security/latest-report.md
 
+      - name: Ensure labels exist
+        if: github.event_name != 'pull_request' && steps.report.outputs.has_critical_or_high == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh label create security --color d93f0b --force
+          gh label create critical-high --color b60205 --force
+
       - name: Comment on PR
         if: github.event_name == 'pull_request'
         uses: marocchino/sticky-pull-request-comment@v2
@@ -166,13 +171,44 @@ jobs:
 
       - name: Open/update tracking issue for Critical/High findings
         if: github.event_name != 'pull_request' && steps.report.outputs.has_critical_or_high == 'true'
-        uses: actions-cool/issues-helper@v3
+        uses: actions/github-script@v7
         with:
-          actions: "create-issue"
-          title: "Security scan: Critical/High findings (${{ github.run_id }})"
-          body-path: docs/security/latest-report.md
-          labels: "security,critical-high"
-        continue-on-error: true
+          script: |
+            const fs = require('fs');
+            const body = fs.readFileSync('docs/security/latest-report.md', 'utf8');
+            const title = "Security scan: Critical/High findings";
+            const labels = ["security", "critical-high"];
+
+            const existing = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: "open",
+              labels: labels.join(","),
+            });
+
+            if (existing.data.length > 0) {
+              const issue = existing.data[0];
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                body,
+              });
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                body: `Updated by run ${context.runId}`,
+              });
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title,
+                body,
+                labels,
+              });
+            }
 
       - name: Open PR with updated security report
         if: github.event_name != 'pull_request' && steps.report.outputs.has_critical_or_high == 'true'
