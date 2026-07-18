@@ -102,15 +102,14 @@ jobs:
         with:
           target: "http://localhost:3000"
           rules_file_name: ".zap/rules.tsv"
-          cmd_options: "-J zap-report.json -r zap-report.html"
           fail_action: false
           allow_issue_writing: false
       - name: Collect ZAP reports
         if: always()
         run: |
           mkdir -p reports
-          cp zap-report.json reports/ 2>/dev/null || true
-          cp zap-report.html reports/ 2>/dev/null || true
+          cp report_json.json reports/zap-report.json 2>/dev/null || true
+          cp report_html.html reports/zap-report.html 2>/dev/null || true
       - name: Upload ZAP report
         if: always()
         uses: actions/upload-artifact@v4
