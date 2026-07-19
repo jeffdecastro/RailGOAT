@@ -3,7 +3,10 @@ name: Security Pipeline
 # SCA is handled continuously by Dependabot (.github/dependabot.yml).
 # This workflow covers: automated tests, SAST (Brakeman) and DAST (OWASP ZAP),
 # then rolls Critical/High findings into a developer-readable report that is
-# posted to the PR and, on master, tracked via an Issue + report PR.
+# posted to the PR and, on master, tracked via an Issue + report PR. A second,
+# experimental PR comment from jeffdecastro/security-pipeline-shared asks
+# Gemini to turn the same Brakeman/ZAP findings into a dev-readable,
+# risk-prioritized summary, posted alongside the report above.
 
 on:
   push:
@@ -233,3 +236,19 @@ jobs:
           body-path: docs/security/latest-report.md
           labels: security,critical-high
           add-paths: docs/security/latest-report.md
+
+  gemini-report:
+    name: Gemini Report (dev-readable, risk-prioritized)
+    # Experimental second PR comment, posted alongside security-report above,
+    # for evaluating a Gemini-generated summary before it replaces anything.
+    if: always() && github.event_name == 'pull_request'
+    needs: [brakeman, zap]
+    uses: jeffdecastro/security-pipeline-shared/.github/workflows/gemini-report.yml@main
+    permissions:
+      contents: read
+      pull-requests: write
+    with:
+      pr_number: ${{ github.event.pull_request.number }}
+      artifact_manifest: "brakeman-json=brakeman-report,zap-json=zap-report"
+    secrets:
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
