@@ -1,0 +1,5 @@
+# ZAP baseline scan rule overrides for RailsGoat.
+# Format: <rule id>\t<action: IGNORE|WARN|FAIL>\t<url pattern, optional>
+# RailsGoat is intentionally vulnerable — everything stays at default (reported),
+# nothing is suppressed. Add IGNORE rows here only for confirmed false positives,
+# with a comment explaining why.

@@ -1,0 +1,199 @@
+name: Security Scan
+
+# Reporting-only security telemetry pipeline: Semgrep + Trivy (static) and
+# OWASP ZAP + StackHawk (dynamic, against a RailsGoat instance built and
+# booted from this checkout via docker-compose), followed by a
+# Gemini-generated, CWE-aware, risk-prioritized PR comment via
+# jeffdecastro/security-pipeline-shared. This workflow must never modify
+# repository files, and must never fail the build based on findings — see
+# continue-on-error below on every build/boot/scan/report step.
+#
+# StackHawk requires a HAWK_API_KEY repo secret and a real applicationId in
+# stackhawk.yml (both from your StackHawk account/dashboard) — neither is
+# configured yet, so that step will no-op until you add them. Its results
+# also aren't wired into the Gemini report below: security-pipeline-shared's
+# normalize.py has no StackHawk parser (only semgrep-sarif, trivy-sarif,
+# nuclei-jsonl, brakeman-json, zap-json), so raw output is just uploaded as
+# a build artifact for manual review for now.
+
+on:
+  pull_request:
+    branches: [master, main]
+  push:
+    branches: [master, main]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: >
+          PR number to post the Gemini report comment to (for manually
+          testing gemini-report without relying on a live pull_request
+          event, e.g. against this fork's own PRs)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  static-analysis:
+    name: Static Analysis (Semgrep + Trivy)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Run Semgrep (Ruby/Rails rulesets)
+        continue-on-error: true
+        run: |
+          docker run --rm \
+            --platform linux/amd64 \
+            -v "${{ github.workspace }}:/src" \
+            -w /src \
+            semgrep/semgrep@sha256:2b33f46ba66cf8cc2ad59ccfa7d22951fd00c632c38f1339e84ec8e6e641a942 \
+            semgrep scan \
+              --config=p/ruby \
+              --config=p/security-audit \
+              --config=p/owasp-top-ten \
+              --config=p/cwe-top-25 \
+              --sarif \
+              --output=semgrep.sarif \
+              --no-git-ignore \
+              .
+
+      - name: Run Trivy filesystem scan (Gemfile.lock + source)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        continue-on-error: true
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,misconfig,secret
+          format: sarif
+          output: trivy.sarif
+          severity: CRITICAL,HIGH,MEDIUM,LOW
+          exit-code: '0'
+
+      - name: Upload Semgrep SARIF to code scanning
+        uses: github/codeql-action/upload-sarif@08d09a53f0f5d694f253bd25732e4429c9e9337f # v3.37.2
+        continue-on-error: true
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep
+
+      - name: Upload Trivy SARIF to code scanning
+        uses: github/codeql-action/upload-sarif@08d09a53f0f5d694f253bd25732e4429c9e9337f # v3.37.2
+        continue-on-error: true
+        with:
+          sarif_file: trivy.sarif
+          category: trivy
+
+      - name: Upload Semgrep SARIF artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: semgrep-output
+          path: semgrep.sarif
+          if-no-files-found: warn
+
+      - name: Upload Trivy SARIF artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: trivy-output
+          path: trivy.sarif
+          if-no-files-found: warn
+
+  dynamic-scan:
+    name: Dynamic Scan (ZAP + StackHawk against live RailsGoat)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Build RailsGoat image
+        continue-on-error: true
+        run: docker compose build web
+
+      # db:setup (not create/migrate/seed as separate steps) run inline with
+      # boot, matching the pattern already proven working in PR #1's ZAP job.
+      - name: Boot RailsGoat (db:setup + rails server)
+        continue-on-error: true
+        run: |
+          docker compose run -d --name railsgoat_web -p 3000:3000 web \
+            bash -c "bundle exec rails db:setup || true; bundle exec rails s -p 3000 -b 0.0.0.0"
+          for i in $(seq 1 30); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:3000/ || echo "000")
+            [ "$code" = "200" ] && break
+            echo "Waiting for app... ($i, last status $code)"
+            sleep 5
+          done
+
+      - name: OWASP ZAP baseline scan
+        continue-on-error: true
+        uses: zaproxy/action-baseline@de8ad967d3548d44ef623df22cf95c3b0baf8b25 # v0.15.0
+        with:
+          target: "http://localhost:3000"
+          rules_file_name: ".zap/rules.tsv"
+          fail_action: false
+          allow_issue_writing: false
+
+      - name: Collect ZAP report
+        continue-on-error: true
+        run: |
+          mkdir -p zap-results
+          cp report_json.json zap-results/zap-report.json 2>/dev/null || true
+
+      # Requires HAWK_API_KEY (repo secret, not yet configured) and a real
+      # applicationId in stackhawk.yml (placeholder until you fill in your
+      # StackHawk app's ID). Results aren't normalized into the Gemini report
+      # below — only uploaded as a raw artifact — since security-pipeline-shared
+      # has no StackHawk parser yet (see comment near the top of this file).
+      - name: StackHawk (HawkScan) DAST scan
+        continue-on-error: true
+        uses: stackhawk/hawkscan-action@f73954d54f3ba2d6d342f936e2282c886bad5d95 # v3.0.0
+        with:
+          apiKey: ${{ secrets.HAWK_API_KEY }}
+
+      - name: Dump RailsGoat container logs on failure
+        if: failure()
+        continue-on-error: true
+        run: docker logs railsgoat_web || true
+
+      - name: Stop RailsGoat container
+        if: always()
+        continue-on-error: true
+        run: docker rm -f railsgoat_web || true
+
+      - name: Upload ZAP results artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: zap-results
+          path: zap-results/zap-report.json
+          if-no-files-found: warn
+
+      - name: Upload StackHawk raw results artifact (not yet parsed by the shared pipeline)
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: stackhawk-results
+          path: .hawk/
+          if-no-files-found: ignore
+
+  gemini-report:
+    name: Gemini Report (dev-readable, risk-prioritized)
+    if: always() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
+    needs: [static-analysis, dynamic-scan]
+    uses: jeffdecastro/security-pipeline-shared/.github/workflows/gemini-report.yml@ae4c89df26ae58928a4b456f6e019d1a1daaa200 # main @ 2026-07-22
+    permissions:
+      contents: read
+      pull-requests: write
+    with:
+      pr_number: ${{ github.event.pull_request.number || inputs.pr_number }}
+      artifact_manifest: "semgrep-sarif=semgrep-output,trivy-sarif=trivy-output,zap-json=zap-results"
+      shared_ref: ae4c89df26ae58928a4b456f6e019d1a1daaa200
+    secrets:
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}

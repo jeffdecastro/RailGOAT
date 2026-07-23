@@ -1,0 +1,16 @@
+# StackHawk (HawkScan) configuration for the security-scan.yml dynamic-scan job.
+#
+# TWO things must be filled in by hand before this scan does anything real:
+#   1. applicationId below — get this from your app's page at
+#      https://app.stackhawk.com (Create an app if you haven't yet).
+#   2. the HAWK_API_KEY repository secret (Settings > Secrets and variables >
+#      Actions) — from your StackHawk account's API keys page.
+# Until both are set, the HawkScan step in security-scan.yml will fail
+# harmlessly (continue-on-error: true) and produce no results.
+app:
+  applicationId: "REPLACE_WITH_YOUR_STACKHAWK_APPLICATION_ID"
+  env: Development
+  host: http://localhost:3000
+hawk:
+  spider:
+    base: true
