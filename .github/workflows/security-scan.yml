@@ -1,12 +1,20 @@
 name: Security Scan
 
 # Reporting-only security telemetry pipeline: Semgrep + Trivy (static) and
-# Nuclei (dynamic, against a RailsGoat instance built and booted from this
-# checkout via docker-compose), followed by a Gemini-generated, CWE-aware,
-# risk-prioritized PR comment via jeffdecastro/security-pipeline-shared.
-# This workflow must never modify repository files, and must never fail
-# the build based on findings — see continue-on-error below on every
-# build/boot/scan/report step.
+# OWASP ZAP + StackHawk (dynamic, against a RailsGoat instance built and
+# booted from this checkout via docker-compose), followed by a
+# Gemini-generated, CWE-aware, risk-prioritized PR comment via
+# jeffdecastro/security-pipeline-shared. This workflow must never modify
+# repository files, and must never fail the build based on findings — see
+# continue-on-error below on every build/boot/scan/report step.
+#
+# StackHawk requires a HAWK_API_KEY repo secret and a real applicationId in
+# stackhawk.yml (both from your StackHawk account/dashboard) — neither is
+# configured yet, so that step will no-op until you add them. Its results
+# also aren't wired into the Gemini report below: security-pipeline-shared's
+# normalize.py has no StackHawk parser (only semgrep-sarif, trivy-sarif,
+# nuclei-jsonl, brakeman-json, zap-json), so raw output is just uploaded as
+# a build artifact for manual review for now.
 
 on:
   pull_request:
@@ -96,7 +104,7 @@ jobs:
           if-no-files-found: warn
 
   dynamic-scan:
-    name: Dynamic Scan (Nuclei against live RailsGoat)
+    name: Dynamic Scan (ZAP + StackHawk against live RailsGoat)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -109,45 +117,71 @@ jobs:
         continue-on-error: true
         run: docker compose build web
 
-      - name: Initialize database (sqlite) and boot RailsGoat
+      # db:setup (not create/migrate/seed as separate steps) run inline with
+      # boot, matching the pattern already proven working in PR #1's ZAP job.
+      - name: Boot RailsGoat (db:setup + rails server)
         continue-on-error: true
         run: |
-          docker compose run --rm web bundle exec rake db:create db:migrate db:seed
-          docker compose up -d web
-          for i in $(seq 1 40); do
-            curl -sf http://localhost:3000/ && break
+          docker compose run -d --name railsgoat_web -p 3000:3000 web \
+            bash -c "bundle exec rails db:setup || true; bundle exec rails s -p 3000 -b 0.0.0.0"
+          for i in $(seq 1 30); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:3000/ || echo "000")
+            [ "$code" = "200" ] && break
+            echo "Waiting for app... ($i, last status $code)"
             sleep 5
           done
 
-      - name: Run Nuclei against local RailsGoat instance
+      - name: OWASP ZAP baseline scan
+        continue-on-error: true
+        uses: zaproxy/action-baseline@de8ad967d3548d44ef623df22cf95c3b0baf8b25 # v0.15.0
+        with:
+          target: "http://localhost:3000"
+          rules_file_name: ".zap/rules.tsv"
+          fail_action: false
+          allow_issue_writing: false
+
+      - name: Collect ZAP report
         continue-on-error: true
         run: |
-          mkdir -p nuclei-results
-          docker run --rm --network host \
-            --platform linux/amd64 \
-            -v "${{ github.workspace }}/nuclei-results:/output" \
-            projectdiscovery/nuclei@sha256:8b82dfd56c02cbc47a6d328c58ff3292bfdb633e964f0f119b6d41d3a5ee33ef \
-            -target http://localhost:3000 \
-            -jsonl \
-            -output /output/nuclei-results.json
+          mkdir -p zap-results
+          cp report_json.json zap-results/zap-report.json 2>/dev/null || true
+
+      # Requires HAWK_API_KEY (repo secret, not yet configured) and a real
+      # applicationId in stackhawk.yml (placeholder until you fill in your
+      # StackHawk app's ID). Results aren't normalized into the Gemini report
+      # below — only uploaded as a raw artifact — since security-pipeline-shared
+      # has no StackHawk parser yet (see comment near the top of this file).
+      - name: StackHawk (HawkScan) DAST scan
+        continue-on-error: true
+        uses: stackhawk/hawkscan-action@f73954d54f3ba2d6d342f936e2282c886bad5d95 # v3.0.0
+        with:
+          apiKey: ${{ secrets.HAWK_API_KEY }}
 
       - name: Dump RailsGoat container logs on failure
         if: failure()
         continue-on-error: true
-        run: docker compose logs web || true
+        run: docker logs railsgoat_web || true
 
-      - name: Stop RailsGoat containers
+      - name: Stop RailsGoat container
         if: always()
         continue-on-error: true
-        run: docker compose down -v || true
+        run: docker rm -f railsgoat_web || true
 
-      - name: Upload Nuclei results artifact
+      - name: Upload ZAP results artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
-          name: nuclei-results
-          path: nuclei-results/nuclei-results.json
+          name: zap-results
+          path: zap-results/zap-report.json
           if-no-files-found: warn
+
+      - name: Upload StackHawk raw results artifact (not yet parsed by the shared pipeline)
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: stackhawk-results
+          path: .hawk/
+          if-no-files-found: ignore
 
   gemini-report:
     name: Gemini Report (dev-readable, risk-prioritized)
@@ -159,7 +193,7 @@ jobs:
       pull-requests: write
     with:
       pr_number: ${{ github.event.pull_request.number || inputs.pr_number }}
-      artifact_manifest: "semgrep-sarif=semgrep-output,trivy-sarif=trivy-output,nuclei-jsonl=nuclei-results"
+      artifact_manifest: "semgrep-sarif=semgrep-output,trivy-sarif=trivy-output,zap-json=zap-results"
       shared_ref: ae4c89df26ae58928a4b456f6e019d1a1daaa200
     secrets:
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
