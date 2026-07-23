@@ -2,6 +2,8 @@
 require "encryption"
 
 class User < ApplicationRecord
+  attr_accessor :password
+
   validates :password, :presence => true,
                         :confirmation => true,
                         :if => :password,
@@ -27,7 +29,9 @@ class User < ApplicationRecord
       build_paid_time_off(POPULATE_PAID_TIME_OFF.shuffle.first).schedule.build(POPULATE_SCHEDULE.shuffle.first)
       build_work_info(POPULATE_WORK_INFO.shuffle.first)
       # Uncomment below line to use encrypted SSN(s)
-      work_info.build_key_management(:iv => SecureRandom.hex(32))
+      # aes-256-cbc requires exactly a 16-byte IV; SecureRandom.hex(n) returns
+      # a string of 2n bytes (hex-encoded), so this must be hex(8), not hex(32).
+      work_info.build_key_management(:iv => SecureRandom.hex(8))
       performance.build(POPULATE_PERFORMANCE.shuffle.first)
     end
 
@@ -39,7 +43,7 @@ class User < ApplicationRecord
 
     def self.authenticate(email, password)
       user = find_by_email(email) || User.new(:password => "")
-      if Rack::Utils.secure_compare(user.password, Digest::MD5.hexdigest(password))
+      if Rack::Utils.secure_compare(user.password_hash.to_s, Digest::MD5.hexdigest(password))
         return user
       else
         raise "Incorrect username or password"
@@ -47,8 +51,8 @@ class User < ApplicationRecord
     end
 
     def hash_password
-      if will_save_change_to_password?
-        self.password = Digest::MD5.hexdigest(self.password)
+      if password.present?
+        self.password_hash = Digest::MD5.hexdigest(password)
       end
     end
 

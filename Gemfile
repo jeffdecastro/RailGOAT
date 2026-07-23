@@ -54,6 +54,7 @@ group :development, :test, :mysql do
   gem "launchy"
   gem "poltergeist"
   gem "rspec-rails"
+  gem "rspec_junit_formatter"
   gem "test-unit"
 end
 

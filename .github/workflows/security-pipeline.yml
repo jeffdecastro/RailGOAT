@@ -1,0 +1,254 @@
+name: Security Pipeline
+
+# SCA is handled continuously by Dependabot (.github/dependabot.yml).
+# This workflow covers: automated tests, SAST (Brakeman) and DAST (OWASP ZAP),
+# then rolls Critical/High findings into a developer-readable report that is
+# posted to the PR and, on master, tracked via an Issue + report PR. A second,
+# experimental PR comment from jeffdecastro/security-pipeline-shared asks
+# Gemini to turn the same Brakeman/ZAP findings into a dev-readable,
+# risk-prioritized summary, posted alongside the report above.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  schedule:
+    - cron: "0 6 * * 1" # weekly, Monday 06:00 UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  security-events: write
+
+jobs:
+  # ruby:2.5.0 (Debian stretch, glibc 2.24) can't run the Node 24 runtime GitHub
+  # Actions now forces for JS-based actions, so these jobs can't use the
+  # `container:` job feature (actions/checkout would crash inside it). Instead
+  # we check out on the host and do all Ruby work via `docker run` against the
+  # same image the app actually runs on.
+  # Non-blocking: spec/vulnerabilities/*_spec.rb are RailsGoat's intentional
+  # OWASP lessons and are *expected* to fail against this deliberately
+  # vulnerable app in default/training mode (see
+  # spec/support/capybara_shared.rb). Gating the pipeline on them would keep
+  # every PR permanently red until someone patches an intentional
+  # vulnerability, which defeats the point of the app. Results still run and
+  # are visible in the job output/logs for anyone tracking remediation
+  # progress.
+  test:
+    name: Test suite
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run test suite in ruby:2.5.0
+        run: |
+          docker run --rm -v "$PWD":/myapp -w /myapp ruby:2.5.0 bash -c '
+            set -e
+            printf "%s\n" \
+              "deb [trusted=yes] http://archive.debian.org/debian stretch main" \
+              "deb [trusted=yes] http://archive.debian.org/debian-security stretch/updates main" \
+              > /etc/apt/sources.list
+            apt-get -o Acquire::Check-Valid-Until=false update -qq
+            apt-get install -y build-essential libpq-dev nodejs sqlite3 libsqlite3-dev \
+              wget bzip2 libfontconfig1 fonts-liberation >/dev/null
+            wget -q https://assets.membergetmember.co/software/phantomjs-2.1.1-linux-x86_64.tar.bz2 -O /tmp/phantomjs.tar.bz2
+            tar -xjf /tmp/phantomjs.tar.bz2 -C /usr/local/share
+            ln -s /usr/local/share/phantomjs-2.1.1-linux-x86_64/bin/phantomjs /usr/local/bin/phantomjs
+            bundle install --jobs 4 --retry 3
+            bundle exec rails db:schema:load RAILS_ENV=test || bundle exec rake db:test:prepare
+            bundle exec rspec --format progress --format RspecJunitFormatter --out tmp/rspec-results.xml
+          '
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: tmp/rspec-results.xml
+          if-no-files-found: ignore
+
+  brakeman:
+    name: SAST (Brakeman)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run Brakeman in ruby:2.5.0
+        run: |
+          mkdir -p reports
+          docker run --rm -v "$PWD":/myapp -w /myapp ruby:2.5.0 bash -c '
+            set -e
+            gem install brakeman -v "~> 5.4" --no-document -q
+            brakeman -o reports/brakeman.json -o reports/brakeman.html --no-exit-on-warn --no-exit-on-error
+          '
+      - name: Upload Brakeman report
+        uses: actions/upload-artifact@v4
+        with:
+          name: brakeman-report
+          path: reports/
+
+  zap:
+    name: DAST (OWASP ZAP)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build app image
+        run: docker compose build web
+      - name: Boot app
+        run: |
+          docker compose run -d --name railsgoat_web -p 3000:3000 web \
+            bash -c "bundle exec rails db:setup || true; bundle exec rails s -p 3000 -b 0.0.0.0"
+      - name: Wait for app to become healthy
+        run: |
+          for i in $(seq 1 30); do
+            code=$(curl -s -o /tmp/root_response.html -w '%{http_code}' http://localhost:3000/ || echo "000")
+            if [ "$code" = "200" ]; then
+              echo "App is up"; exit 0
+            fi
+            echo "Waiting for app... ($i, last status $code)"; sleep 5
+          done
+          echo "App did not become healthy in time. Last response body:"
+          cat /tmp/root_response.html || true
+          echo "Container logs:"
+          docker logs railsgoat_web || true
+          exit 1
+      - name: ZAP baseline scan
+        uses: zaproxy/action-baseline@v0.15.0
+        with:
+          target: "http://localhost:3000"
+          rules_file_name: ".zap/rules.tsv"
+          fail_action: false
+          allow_issue_writing: false
+      - name: Collect ZAP reports
+        if: always()
+        run: |
+          mkdir -p reports
+          cp report_json.json reports/zap-report.json 2>/dev/null || true
+          cp report_html.html reports/zap-report.html 2>/dev/null || true
+      - name: Upload ZAP report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-report
+          path: reports/
+      - name: Tear down app
+        if: always()
+        run: docker rm -f railsgoat_web || true
+
+  security-report:
+    name: Build security report
+    needs: [test, brakeman, zap]
+    if: always()
+    runs-on: ubuntu-latest
+    outputs:
+      has_critical_or_high: ${{ steps.report.outputs.has_critical_or_high }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: brakeman-report
+          path: reports/brakeman
+        continue-on-error: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: zap-report
+          path: reports/zap
+        continue-on-error: true
+      - name: Generate developer-readable report
+        id: report
+        run: |
+          ruby scripts/security/generate_security_report.rb \
+            --brakeman reports/brakeman/brakeman.json \
+            --zap reports/zap/zap-report.json \
+            --out docs/security/latest-report.md
+          echo "has_critical_or_high=$(cat reports/has_critical_or_high.txt)" >> "$GITHUB_OUTPUT"
+      - name: Upload rendered report
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-report-markdown
+          path: docs/security/latest-report.md
+
+      - name: Ensure labels exist
+        if: github.event_name != 'pull_request' && steps.report.outputs.has_critical_or_high == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh label create security --color d93f0b --force
+          gh label create critical-high --color b60205 --force
+
+      - name: Comment on PR
+        if: github.event_name == 'pull_request'
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: security-pipeline-report
+          path: docs/security/latest-report.md
+
+      - name: Open/update tracking issue for Critical/High findings
+        if: github.event_name != 'pull_request' && steps.report.outputs.has_critical_or_high == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const body = fs.readFileSync('docs/security/latest-report.md', 'utf8');
+            const title = "Security scan: Critical/High findings";
+            const labels = ["security", "critical-high"];
+
+            const existing = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: "open",
+              labels: labels.join(","),
+            });
+
+            if (existing.data.length > 0) {
+              const issue = existing.data[0];
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                body,
+              });
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                body: `Updated by run ${context.runId}`,
+              });
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title,
+                body,
+                labels,
+              });
+            }
+
+      - name: Open PR with updated security report
+        if: github.event_name != 'pull_request' && steps.report.outputs.has_critical_or_high == 'true'
+        uses: peter-evans/create-pull-request@v6
+        with:
+          commit-message: "security: update Critical/High findings report"
+          branch: security/report-update
+          delete-branch: true
+          title: "[Security] Critical/High findings report — ${{ github.run_id }}"
+          body-path: docs/security/latest-report.md
+          labels: security,critical-high
+          add-paths: docs/security/latest-report.md
+
+  gemini-report:
+    name: Gemini Report (dev-readable, risk-prioritized)
+    # Experimental second PR comment, posted alongside security-report above,
+    # for evaluating a Gemini-generated summary before it replaces anything.
+    if: always() && github.event_name == 'pull_request'
+    needs: [brakeman, zap]
+    uses: jeffdecastro/security-pipeline-shared/.github/workflows/gemini-report.yml@main
+    permissions:
+      contents: read
+      pull-requests: write
+    with:
+      pr_number: ${{ github.event.pull_request.number }}
+      artifact_manifest: "brakeman-json=brakeman-report,zap-json=zap-report"
+    secrets:
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
